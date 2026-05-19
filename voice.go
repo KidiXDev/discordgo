@@ -219,6 +219,8 @@ func (v *VoiceConnection) Close() {
 
 	v.Ready = false
 	v.speaking = false
+	controller := v.daveController
+	v.daveController = nil
 
 	if v.close != nil {
 		v.log(LogInformational, "closing v.close")
@@ -257,6 +259,10 @@ func (v *VoiceConnection) Close() {
 		}
 
 		v.wsConn = nil
+	}
+
+	if controller != nil {
+		closeDAVEController(controller)
 	}
 }
 
@@ -369,6 +375,36 @@ type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
 	SSRC     int    `json:"ssrc"`
 	Speaking bool   `json:"speaking"`
+}
+
+// UnmarshalJSON accepts Discord's `speaking` payload as either a bool
+// (legacy) or an integer bitmask (v8 voice). Any non-zero bitmask is
+// treated as speaking=true.
+func (v *VoiceSpeakingUpdate) UnmarshalJSON(data []byte) error {
+	type alias VoiceSpeakingUpdate
+	aux := &struct {
+		Speaking json.RawMessage `json:"speaking"`
+		*alias
+	}{alias: (*alias)(v)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if len(aux.Speaking) == 0 {
+		return nil
+	}
+
+	var b bool
+	if err := json.Unmarshal(aux.Speaking, &b); err == nil {
+		v.Speaking = b
+		return nil
+	}
+
+	var n int
+	if err := json.Unmarshal(aux.Speaking, &n); err != nil {
+		return fmt.Errorf("VoiceSpeakingUpdate.speaking: %w", err)
+	}
+	v.Speaking = n != 0
+	return nil
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -516,6 +552,9 @@ func (v *VoiceConnection) open() (err error) {
 	}
 	if v.MaxDAVEProtocolVersion == 0 {
 		v.MaxDAVEProtocolVersion = defaultDAVEProtocolVersion
+	}
+	if v.daveController == nil {
+		v.daveController = newDefaultDAVEController(v)
 	}
 	if !v.reconnecting {
 		v.voiceSeqAck = initialVoiceSequenceAck
@@ -779,10 +818,6 @@ func (v *VoiceConnection) onEvent(messageType int, message []byte) {
 		return
 
 	case 5:
-		if len(v.voiceSpeakingUpdateHandlers) == 0 {
-			return
-		}
-
 		voiceSpeakingUpdate := &VoiceSpeakingUpdate{}
 		if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 			v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
@@ -792,6 +827,12 @@ func (v *VoiceConnection) onEvent(messageType int, message []byte) {
 		for _, h := range v.voiceSpeakingUpdateHandlers {
 			h(v, voiceSpeakingUpdate)
 		}
+		v.withDAVEController(func(c VoiceDAVEController) {
+			if observer, ok := c.(voiceDAVESpeakingObserver); ok {
+				observer.HandleSpeakingUpdate(v, voiceSpeakingUpdate)
+			}
+		})
+		return
 
 	default:
 		v.log(LogDebug, "unknown voice operation, %d, %s", e.Operation, string(e.RawData))
